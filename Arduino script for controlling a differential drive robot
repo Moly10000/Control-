@@ -1,0 +1,233 @@
+float sp_motor1, sp_motor2; // Setpoints para los motores 1 y 2
+
+int PWM_salida_motor1 = 6; // Pin de salida PWM para el motor 1
+int PWM_salida_motor2 = 9; // Pin de salida PWM para el motor 2
+float cv_motor1, cv_motor2; // Variables de control para los motores 1 y 2
+
+int pinA_motor1 = 2; // Pin de la interrupción para el encoder del motor 1
+int pinA_motor2 = 3; // Pin de la interrupción para el encoder del motor 2
+volatile int contador_motor1 = 0; // Contador de pulsos del encoder para el motor 1
+volatile int contador_motor2 = 0; // Contador de pulsos del encoder para el motor 2
+
+// Matriz para la posición inicial (x, y) del robot
+float posInicial[2] = {0.0, 0.0};  // Inicializa en el origen (0, 0)
+
+// Matriz para la posición deseada (setpoint) a la que el robot debe llegar
+float posDeseada[2] = {5.0, 3.0};  // Por ejemplo, el robot debe llegar a la posición (5, 3)
+
+// Matriz 2x2 para constantes proporcionales
+float constantesProporcionales[2][2] = {
+  {2.0, 2.0},
+  {2.0, 2.0}
+};
+
+// Definir constantes R y L
+float R = 0.0325;  // Reemplaza con el valor adecuado para el radio de la rueda 32.5 de Radio 
+float L = 0.24;  // Reemplaza con el valor adecuado para la longitud entre las ruedas 0.24m de distancia
+
+// Matriz 2x2 para los valores R/2, R/2, R/L, -R/2
+float delta[2][2] = {
+  {R / 2.0, R / 2.0},
+  {R / L, -R / L}
+};
+
+// Matriz 2x2 para delta inversa
+float deltaInversa[2][2];
+
+float RPM[2] = {50.0, 49.5};  // RPM de los motores 1 y 2
+
+float velocidadesFinales[2] = {0.0, 0.0};
+
+unsigned long previousMillis = 0;
+long interval = 100; // Intervalo de muestreo en milisegundos
+
+float cv1_motor1, error1_motor1, error2_motor1; // Variables para el motor 1
+float cv1_motor2, error1_motor2, error2_motor2; // Variables para el motor 2
+
+float Kp_motor1 = 1.2*(0.17525/(12.533*0.3505));  // Ganancias PID para el motor 1 Motor de 130 RPM
+float Ki_motor1 = 0.47874/0.0701;
+float Kd_motor1 = 0.5*0.03505*0.47874;
+float Tm_motor1 = 0.1;
+
+/*float Kp_motor2 = 0.5554;  // Ganancias PID para el motor 2 Motor de 500 RPM
+float Ki_motor2 = 0.554/0.19;
+float Kd_motor2 = 0.5*0.095*0.5554;
+float Tm_motor2 = 0.1;*/
+
+float Kp_motor2 = 1.2*(0.10025/(12.533*0.2005));  // Ganancias PID para el motor 2 Motor de 500 RPM
+float Ki_motor2 = 6.8294;
+float Kd_motor2 = 0.5*0.02005*0.47874;
+float Tm_motor2 = 0.1;
+
+void setup() {
+  pinMode(pinA_motor1, INPUT);
+  pinMode(pinA_motor2, INPUT);
+  pinMode(PWM_salida_motor1, OUTPUT);
+  pinMode(PWM_salida_motor2, OUTPUT);
+  Serial.begin(115200);
+
+  attachInterrupt(digitalPinToInterrupt(pinA_motor1), interrupcionMotor1, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinA_motor2), interrupcionMotor2, RISING);
+
+  // Calcula la inversa de la matriz delta
+  calcularInversa(delta, deltaInversa);
+  
+}
+
+// Función para multiplicar una matriz 2x2 por una matriz 2x1
+void multiplicarMatrizKPorError(float matriz[2][2], float vector[2], float resultado[2]) {
+  for (int i = 0; i < 2; ++i) {
+    resultado[i] = 0.0;
+    for (int j = 0; j < 2; ++j) {
+      resultado[i] += matriz[i][j] * vector[j];
+    }
+  }
+}
+
+// Función para multiplicar una matriz 2x2 por una matriz 2x1
+void multiplicarDeltaInversaPorVelocidades(float matriz[2][2], float vector[2], float resultado[2]) {
+  for (int i = 0; i < 2; ++i) {
+    resultado[i] = 0.0;
+    for (int j = 0; j < 2; ++j) {
+      resultado[i] += matriz[i][j] * vector[j];
+    }
+  }
+}
+
+// Función para multiplicar una matriz 2x2 por una matriz 2x1
+void multiplicarDeltaPorRPM(float matriz[2][2], float vector[2], float resultado[2]) {
+  for (int i = 0; i < 2; ++i) {
+    resultado[i] = 0.0;
+    for (int j = 0; j < 2; ++j) {
+      resultado[i] += matriz[i][j] * vector[j];
+    }
+  }
+}
+
+float saturarSalida(float cv) {
+  if (cv > 500.0) {
+    return 500.0;
+  } else if (cv < 20.0) {
+    return 20.0;
+  } else {
+    return cv;
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if ((currentMillis - previousMillis) >= interval) {
+    previousMillis = currentMillis;
+    // RPM del eje principal para el motor 1 y el motor 2
+    float pv_motor1 = 10 * contador_motor1 * (60.0 / 371.0);
+    float pv_motor2 = 10 * contador_motor2 * (60.0 / 371.0);
+    contador_motor1 = 0;
+    contador_motor2 = 0;
+
+    // Setpoints para las RPM
+    sp_motor1 = RPM[0];
+    sp_motor2 = RPM[1];
+
+    // Calcula los errores para el motor 1 y el motor 2
+    float error_motor1 = sp_motor1 - pv_motor1;
+    float error_motor2 = sp_motor2 - pv_motor2;
+
+    // Calcula las señales de control PID para el motor 1 y el motor 2
+    cv_motor1 = calcularPID(error_motor1, &cv1_motor1, &error1_motor1, &error2_motor1, Kp_motor1, Ki_motor1, Kd_motor1, Tm_motor1);
+    cv_motor2 = calcularPID(error_motor2, &cv1_motor2, &error1_motor2, &error2_motor2, Kp_motor2, Ki_motor2, Kd_motor2, Tm_motor2);
+
+    // Saturación de las señales de control
+    cv_motor1 = saturarSalida(cv_motor1);
+    cv_motor2 = saturarSalida(cv_motor2);
+
+    // Aplica las señales de control a los motores
+    analogWrite(PWM_salida_motor1, cv_motor1 * (255.0 / 500.0));
+    analogWrite(PWM_salida_motor2, cv_motor2 * (255.0 / 500.0));
+
+    // Calcula el error entre la posición deseada y la posición actual
+    float errorX = posDeseada[0] - posInicial[0];
+    float errorY = posDeseada[1] - posInicial[1];
+    
+    // Calcula la distancia euclidiana entre la posición actual y la deseada
+    float distancia = sqrt(errorX * errorX + errorY * errorY);
+
+    // Crea una matriz 2x1 para representar el error
+    float error[2] = {errorX, errorY};
+
+    // Matriz 2x1 para velocidades (lineal y angular) del robot
+    float velocidades[2];  // Inicializadas a cero
+    multiplicarMatrizKPorError(constantesProporcionales, error, velocidades);
+
+    // Matriz 2x1 para velocidades angulares de las ruedas
+    float RPM[2];
+    multiplicarDeltaInversaPorVelocidades(deltaInversa, velocidades, RPM);
+
+    // Matriz 2x1 para velocidades (lineal y angular) finales del robot
+    float velocidadesFinales[2];
+    multiplicarDeltaPorRPM(delta, RPM, velocidadesFinales);
+
+    // Integra las velocidades para obtener el cambio en la posición
+    posInicial[0] += velocidadesFinales[0] * interval / 1000.0;  // Velocidad lineal x tiempo
+    posInicial[1] += velocidadesFinales[1] * interval / 1000.0;  // Velocidad angular x tiempo
+
+    // Define un umbral de distancia para determinar cuándo detener los motores
+    float umbralDistancia = 0.1;  // Ajusta este valor según sea necesario
+
+    if (distancia < umbralDistancia) {
+      // Detén los motores
+      analogWrite(PWM_salida_motor1, 0);
+      analogWrite(PWM_salida_motor2, 0);
+
+      // Imprime un mensaje indicando que el robot ha llegado a la posición deseada
+      Serial.println("¡El robot ha llegado a la posición deseada!");
+    }
+    
+    // Imprime valores en el monitor serial
+    Serial.print("SP1: ");
+    Serial.print(sp_motor1);
+    Serial.print(" PV1: ");
+    Serial.print(pv_motor1);
+    //Serial.print(" RPM1: ");
+    //Serial.print(pv_motor1);  // Imprime las RPM del motor 1
+    //Serial.print(" Control1: ");
+    //Serial.print(cv_motor1);
+    Serial.print(" | SP2: ");
+    Serial.print(sp_motor2);
+    Serial.print(" PV2: ");
+    Serial.println(pv_motor2);
+    //Serial.print(" RPM2: ");
+    //Serial.println(pv_motor2);  // Imprime las RPM del motor 2
+  }
+}
+
+float calcularPID(float error, float *cv1, float *error1, float *error2, float Kp, float Ki, float Kd, float Tm) {
+  float cv = *cv1 + (Kp + Kd / Tm) * error + (-Kp + Ki * Tm - 2 * Kd / Tm) * (*error1) + (Kd / Tm) * (*error2);
+  *cv1 = cv;
+  *error2 = *error1;
+  *error1 = error;
+  return cv;  
+}
+
+void calcularInversa(float matriz[2][2], float inversa[2][2]) {
+  float determinante = matriz[0][0] * matriz[1][1] - matriz[0][1] * matriz[1][0];
+
+  if (determinante != 0.0) {
+    float factor = 1.0 / determinante;
+    inversa[0][0] = matriz[1][1] * factor;
+    inversa[0][1] = -matriz[0][1] * factor;
+    inversa[1][0] = -matriz[1][0] * factor;
+    inversa[1][1] = matriz[0][0] * factor;
+  } else {
+    // La matriz no tiene inversa (determinante igual a cero)
+    // Puedes manejar esto de acuerdo a tus necesidades específicas
+  }
+}
+
+void interrupcionMotor1() {
+  contador_motor1++;
+}
+
+void interrupcionMotor2() {
+  contador_motor2++;
+}
